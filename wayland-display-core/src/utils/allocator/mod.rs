@@ -24,7 +24,7 @@ pub struct GsGlesbuffer {
 
 impl GsGlesbuffer {
     pub fn new(renderer: &mut GlesRenderer, video_info: VideoInfo) -> Option<Self> {
-        let format = Fourcc::try_from(video_info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888);
+        let format = Fourcc::try_from(video_info.format().to_fourcc()).unwrap_or(Fourcc::Argb8888);
 
         let result = renderer.create_buffer(
             format,
@@ -186,7 +186,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                                     "Failed to convert fourcc to video format: {:?}",
                                     buffer.buffer.format().code
                                 );
-                                VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
+                                VideoFormat::Rgbx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
                             }
                             format => format,
                         };
