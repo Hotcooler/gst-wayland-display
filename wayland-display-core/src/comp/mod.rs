@@ -1,23 +1,18 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ffi::CString,
-    sync::{mpsc::Sender, Arc, Mutex, Weak},
-    time::{Duration, Instant},
-};
-use super::Command;
+use super::{Command, GstVideoInfo};
 use gst_video::VideoInfo;
-use once_cell::sync::Lazy;
+use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::input::AxisSource;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::{
     backend::{
-        allocator::{Fourcc, dmabuf::Dmabuf},
-        drm::{DrmNode, NodeType},
-        egl::{EGLContext, EGLDevice, EGLDisplay},
+        allocator::{dmabuf::Dmabuf, Fourcc},
+        drm::DrmNode,
         libinput::LibinputInputBackend,
         renderer::{
-            element::memory::{MemoryRenderBuffer, MemoryBuffer},
-            damage::{OutputDamageTracker, Error as DTRError},
-            gles::{GlesRenderbuffer, GlesRenderer},
-            Bind, Offscreen,
+            damage::{Error as DTRError, OutputDamageTracker},
+            element::memory::{MemoryBuffer, MemoryRenderBuffer},
+            Bind,
         },
     },
     desktop::{
@@ -40,26 +35,31 @@ use smithay::{
         input::Libinput,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{
-            backend::{GlobalId, ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, GlobalId},
             Display, DisplayHandle,
         },
     },
     utils::{Clock, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
     wayland::{
-        compositor::{with_states, CompositorState, CompositorClientState},
+        compositor::{with_states, CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
-        shell::xdg::{XdgShellState, XdgToplevelSurfaceData, SurfaceCachedState},
+        relative_pointer::RelativePointerManagerState,
+        selection::data_device::DataDeviceState,
+        shell::xdg::{SurfaceCachedState, XdgShellState, XdgToplevelSurfaceData},
         shm::ShmState,
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
-        relative_pointer::RelativePointerManagerState,
-        pointer_constraints::PointerConstraintsState,
-        selection::data_device::DataDeviceState,
     },
 };
-use smithay::backend::input::AxisSource;
+use std::{
+    collections::HashSet,
+    ffi::CString,
+    sync::{mpsc::Sender, Arc},
+    time::{Duration, Instant},
+};
 use tracing::debug;
 
 mod focus;
@@ -69,10 +69,9 @@ mod rendering;
 pub use self::focus::*;
 pub use self::input::*;
 pub use self::rendering::*;
+use crate::utils::allocator::{new_gbm_device, GsBufferType, GsDmaBuf, GsGlesbuffer};
+use crate::utils::renderer::setup_renderer;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
-
-static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default)]
 pub struct ClientState {
@@ -92,15 +91,15 @@ pub(crate) struct State {
 
     // render
     dtr: Option<OutputDamageTracker>,
-    renderbuffer: Option<GlesRenderbuffer>,
+    output_buffer: Option<GsBufferType>,
+    render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
-    egl_display_ref: Arc<EGLDisplay>,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
 
     // management
     pub output: Option<Output>,
-    pub video_info: Option<VideoInfo>,
+    pub video_info: Option<GstVideoInfo>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -128,17 +127,6 @@ pub(crate) struct State {
     cursor_event_count: i32,
 }
 
-pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
-    let drm_node = drm_node
-        .node_with_type(NodeType::Render)
-        .and_then(Result::ok)
-        .unwrap_or(drm_node.clone());
-    EGLDevice::enumerate()
-        .expect("Failed to enumerate EGLDevices")
-        .find(|d| d.try_get_render_node().unwrap_or_default() == Some(drm_node))
-        .expect("Unable to find EGLDevice for drm-node")
-}
-
 pub(crate) fn init(
     command_src: Channel<Command>,
     render: impl Into<RenderTarget>,
@@ -164,38 +152,7 @@ pub(crate) fn init(
     let render_target = render.into();
     let render_node: Option<DrmNode> = render_target.clone().into();
 
-    // init render backend
-    let (egl_display_ref, context) = {
-        let mut displays = EGL_DISPLAYS.lock().unwrap();
-        let maybe_display = displays
-            .get(&render_node)
-            .and_then(|weak_display| weak_display.upgrade());
-
-        let egl = match maybe_display {
-            Some(display) => display,
-            None => {
-                let device = match render_node.as_ref() {
-                    Some(render_node) => get_egl_device_for_node(render_node),
-                    None => EGLDevice::enumerate()
-                        .expect("Failed to enumerate EGLDevices")
-                        .find(|device| {
-                            device
-                                .extensions()
-                                .iter()
-                                .any(|e| e == "EGL_MESA_device_software")
-                        })
-                        .expect("Failed to find software device"),
-                };
-                let egl = unsafe { EGLDisplay::new(device).expect("Failed to create EGLDisplay") };
-                let display = Arc::new(egl);
-                displays.insert(render_node, Arc::downgrade(&display));
-                display
-            }
-        };
-        let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
-        (egl, context)
-    };
-    let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
+    let renderer = setup_renderer(render_node);
     let _ = devices_tx.send(render_target.as_devices());
 
     let shm_state = ShmState::new::<State>(&dh, vec![]);
@@ -220,11 +177,12 @@ pub(crate) fn init(
         None
     };
 
-    let cursor_element =
-        MemoryRenderBuffer::from_memory(MemoryBuffer::from_slice(
-            CURSOR_DATA_BYTES,
-            Fourcc::Abgr8888,
-            (64, 64)), 1, Transform::Normal, None);
+    let cursor_element = MemoryRenderBuffer::from_memory(
+        MemoryBuffer::from_slice(CURSOR_DATA_BYTES, Fourcc::Abgr8888, (64, 64)),
+        1,
+        Transform::Normal,
+        None,
+    );
 
     // init input backend
     let libinput_context = Libinput::new_from_path(NixInterface);
@@ -238,8 +196,7 @@ pub(crate) fn init(
         .expect("Failed to add keyboard to seat");
     seat.add_pointer();
 
-    let mut event_loop =
-        EventLoop::<State>::try_new().expect("Unable to create event_loop");
+    let mut event_loop = EventLoop::<State>::try_new().expect("Unable to create event_loop");
 
     let mut state = State {
         handle: event_loop.handle(),
@@ -247,9 +204,9 @@ pub(crate) fn init(
         clock,
 
         renderer,
-        egl_display_ref,
         dtr: None,
-        renderbuffer: None,
+        output_buffer: None,
+        render_node,
         dmabuf_global,
         video_info: None,
         last_render: None,
@@ -293,11 +250,16 @@ pub(crate) fn init(
         .handle()
         .insert_source(command_src, move |event, _, state| {
             match event {
-                Event::Msg(Command::VideoInfo(info)) => {
-                    debug!("Requested video format: {} .to_fourcc() = {}", info.format(), info.format().to_fourcc());
+                Event::Msg(Command::VideoInfo(video_info)) => {
+                    let base_info: VideoInfo = video_info.clone().into();
+                    debug!(
+                        "Requested video format: {} .to_fourcc() = {}",
+                        base_info.format(),
+                        base_info.format().to_fourcc()
+                    );
                     let size: Size<i32, Physical> =
-                        (info.width() as i32, info.height() as i32).into();
-                    let framerate = info.fps();
+                        (base_info.width() as i32, base_info.height() as i32).into();
+                    let framerate = base_info.fps();
                     let duration = Duration::from_secs_f64(
                         framerate.numer() as f64 / framerate.denom() as f64,
                     );
@@ -327,14 +289,27 @@ pub(crate) fn init(
                     state.space.map_output(&output, (0, 0));
                     state.dtr = Some(dtr);
                     state.pointer_location = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-                    state.renderbuffer = Some(
-                        state
-                            .renderer
-                            .create_buffer(Fourcc::try_from(info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888),
-                                           (info.width() as i32, info.height() as i32).into())
-                            .expect("Failed to create renderbuffer"),
-                    );
-                    state.video_info = Some(info);
+                    match render_target {
+                        RenderTarget::Hardware(_) => match video_info.clone() {
+                            GstVideoInfo::RAW(base_info) => {
+                                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+                                    .expect("Failed to create GsGlesbuffer");
+                                state.output_buffer = Some(GsBufferType::RAW(allocator));
+                            }
+                            GstVideoInfo::DMA(base_info) => {
+                                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
+                                    .expect("Failed to create GsDmaBuf");
+                                state.output_buffer = Some(GsBufferType::DMA(allocator));
+                            }
+                        },
+                        RenderTarget::Software => {
+                            let allocator =
+                                GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                                    .expect("Failed to create GsGlesbuffer");
+                            state.output_buffer = Some(GsBufferType::RAW(allocator));
+                        }
+                    }
+                    state.video_info = Some(video_info);
 
                     let new_size = size
                         .to_f64()
@@ -348,9 +323,15 @@ pub(crate) fn init(
                                 states
                                     .data_map
                                     .get::<XdgToplevelSurfaceData>()
-                                    .map(|_attrs| states.cached_state.get::<SurfaceCachedState>().current().max_size)
+                                    .map(|_attrs| {
+                                        states
+                                            .cached_state
+                                            .get::<SurfaceCachedState>()
+                                            .current()
+                                            .max_size
+                                    })
                             })
-                                .unwrap_or(new_size),
+                            .unwrap_or(new_size),
                         );
 
                         let new_size = max_size
@@ -366,7 +347,9 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {
-                        let framerate = state.video_info.as_ref().unwrap().fps();
+                        let base_info: VideoInfo =
+                            state.video_info.as_ref().unwrap().clone().into();
+                        let framerate = base_info.fps();
                         let duration = Duration::from_secs_f64(
                             framerate.denom() as f64 / framerate.numer() as f64,
                         );
@@ -383,11 +366,14 @@ pub(crate) fn init(
                     let render = move |state: &mut State, now: Instant| {
                         let _span = match tracer {
                             Some(ref tracer) => Some(tracer.trace("render")),
-                            None => None
+                            None => None,
                         };
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
-                                render_result.sync.wait().expect("Error during render_result.sync"); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
+                                render_result
+                                    .sync
+                                    .wait()
+                                    .expect("Error during render_result.sync"); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
                                 let res = buffer_sender.send(Ok(buf));
                                 let rendered_states = &render_result.states;
                                 let rendered_damage = render_result.damage.is_some();
@@ -425,10 +411,13 @@ pub(crate) fn init(
                                     if rendered_damage {
                                         output_presentation_feedback.presented(
                                             state.clock.now(),
-                                            Duration::from_millis(output
-                                                .current_mode()
-                                                .map(|mode| mode.refresh)
-                                                .unwrap_or_default() as u64),
+                                            Duration::from_millis(
+                                                output
+                                                    .current_mode()
+                                                    .map(|mode| mode.refresh)
+                                                    .unwrap_or_default()
+                                                    as u64,
+                                            ),
                                             0,
                                             wp_presentation_feedback::Kind::Vsync,
                                         );
@@ -498,7 +487,35 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::PointerAxis(horizontal_amount, vertical_amount)) => {
                     let time: Duration = state.clock.now().into();
-                    state.pointer_axis(time.as_millis() as u32, AxisSource::Wheel, horizontal_amount * 3.0 / 120.0, vertical_amount * 3.0 / 120.0, Some(horizontal_amount), Some(vertical_amount));
+                    state.pointer_axis(
+                        time.as_millis() as u32,
+                        AxisSource::Wheel,
+                        horizontal_amount * 3.0 / 120.0,
+                        vertical_amount * 3.0 / 120.0,
+                        Some(horizontal_amount),
+                        Some(vertical_amount),
+                    );
+                }
+                Event::Msg(Command::GetSupportedDmaFormats(sender)) => {
+                    let formats = Bind::<Dmabuf>::supported_formats(&state.renderer);
+                    let supported_formats = match state.render_node {
+                        Some(node) => {
+                            let gbm_dev =
+                                new_gbm_device(node).expect("Failed to create gbm device");
+                            formats
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|f| {
+                                    gbm_dev
+                                        .is_format_supported(f.code, BufferObjectFlags::RENDERING)
+                                })
+                                .map(|f| *f)
+                                .collect()
+                        }
+                        None => FormatSet::default(),
+                    };
+                    debug!("Supported dma formats: {:?}", supported_formats);
+                    let _ = sender.send(supported_formats);
                 }
             };
         })
@@ -519,8 +536,8 @@ pub(crate) fn init(
         })
         .expect("Failed to init wayland socket source");
 
-    event_loop.
-        handle()
+    event_loop
+        .handle()
         .insert_source(
             Generic::new(display, Interest::READ, Mode::Level),
             |_, display, state| {
@@ -540,9 +557,7 @@ pub(crate) fn init(
 
     let signal = event_loop.get_signal();
     if let Err(err) = event_loop.run(None, &mut state, |state| {
-        state.dh
-            .flush_clients()
-            .expect("Failed to flush clients");
+        state.dh.flush_clients().expect("Failed to flush clients");
         state.space.refresh();
         state.popups.cleanup();
 
