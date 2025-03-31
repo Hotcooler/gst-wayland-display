@@ -178,7 +178,7 @@ pub(crate) fn init(
     };
 
     let cursor_element = MemoryRenderBuffer::from_memory(
-        MemoryBuffer::from_slice(CURSOR_DATA_BYTES, Fourcc::Abgr8888, (64, 64)),
+        MemoryBuffer::from_slice(CURSOR_DATA_BYTES, Fourcc::Argb8888, (64, 64)),
         1,
         Transform::Normal,
         None,
@@ -280,7 +280,7 @@ pub(crate) fn init(
                     });
                     let mode = OutputMode {
                         size: size.into(),
-                        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
+                        refresh: (duration.as_secs_f64() * 500.0).round() as i32,
                     };
                     output.change_current_state(Some(mode), None, None, None);
                     output.set_preferred(mode);
